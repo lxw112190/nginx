@@ -45,7 +45,7 @@ jobs:
             > /etc/apt/apt.conf.d/99archive
           apt-get -o Acquire::Check-Valid-Until=false update
           apt-get install -y --no-install-recommends \
-            binutils build-essential ca-certificates file git \
+            binutils build-essential ca-certificates curl file git \
             tar
 
       - uses: actions/checkout@v6
