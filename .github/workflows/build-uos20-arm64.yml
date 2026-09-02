@@ -1,0 +1,142 @@
+name: Linux ARM64 (UOS 20 compatible)
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches:
+      - master
+      - 'stable-1.*'
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - master
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PACKAGE_PLATFORM: arm64-uos20
+  PREFIX: /usr/local/nginx
+
+jobs:
+  debian-10-arm64:
+    name: Debian 10 ARM64 / UOS 20 ABI baseline
+    runs-on: ubuntu-22.04-arm
+    container: debian:10-slim
+    timeout-minutes: 60
+
+    steps:
+      - name: Install Debian 10 ARM64 toolchain
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          printf '%s\n' \
+            'deb http://archive.debian.org/debian buster main' \
+            'deb http://archive.debian.org/debian-security buster/updates main' \
+            > /etc/apt/sources.list
+          printf 'Acquire::Check-Valid-Until "false";\n' \
+            > /etc/apt/apt.conf.d/99archive
+          apt-get -o Acquire::Check-Valid-Until=false update
+          apt-get install -y --no-install-recommends \
+            binutils build-essential ca-certificates file git \
+            libpcre2-dev ninja-build zlib1g-dev
+
+      - uses: actions/checkout@v6
+
+      - name: Confirm UOS 20-compatible build baseline
+        run: |
+          test "$(uname -m)" = "aarch64"
+          test "$(getconf GNU_LIBC_VERSION)" = "glibc 2.28"
+          test "$(gcc -dumpfullversion -dumpversion)" = "8.3.0"
+          cat /etc/os-release
+          uname -m
+          getconf GNU_LIBC_VERSION
+          gcc --version | head -n 1
+          make --version | head -n 1
+
+      - name: Configure and build NGINX
+        id: build
+        run: |
+          version="$(sed -n 's/^#define NGINX_VERSION[[:space:]]*"\([^"]*\)"/\1/p' src/core/nginx.h)"
+          test -n "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "NGINX_VERSION=$version" >> "$GITHUB_ENV"
+          echo "PACKAGE_NAME=nginx-${version}-linux-${PACKAGE_PLATFORM}" >> "$GITHUB_ENV"
+
+          ./auto/configure \
+            --prefix="$PREFIX" \
+            --build="debian10-arm64-uos20" \
+            --with-cc-opt="-O2 -pipe -march=armv8-a" \
+            --with-ld-opt="-Wl,-z,relro,-z,now"
+          make -j2
+
+      - name: Test built binary
+        run: |
+          test -x objs/nginx
+          objs/nginx -V
+          file objs/nginx
+          readelf -h objs/nginx | grep -E 'Machine:.*AArch64'
+          if ldd objs/nginx | grep -q 'not found'; then
+            ldd objs/nginx
+            exit 1
+          fi
+
+      - name: Stage and verify UOS 20-compatible artifact
+        run: |
+          stage="$RUNNER_TEMP/$PACKAGE_NAME"
+          rm -rf "$stage"
+          mkdir -p "$stage"
+
+          make install DESTDIR="$stage"
+          install -m 0644 LICENSE "$stage/LICENSE"
+          install -m 0644 README.md "$stage/README.md"
+
+          prefix="$stage$PREFIX"
+          test -x "$prefix/sbin/nginx"
+          "$prefix/sbin/nginx" -t \
+            -p "$prefix/" -c "$prefix/conf/nginx.conf"
+
+          cat > "$stage/BUILD-ENVIRONMENT.txt" <<EOF
+          package_platform=linux-${PACKAGE_PLATFORM}
+          nginx_version=${NGINX_VERSION}
+          machine=$(uname -m)
+          glibc=$(getconf GNU_LIBC_VERSION)
+          gcc=$(gcc -dumpfullversion -dumpversion)
+          kernel=$(uname -sr)
+          configure=--prefix=${PREFIX} --build=debian10-arm64-uos20 --with-cc-opt=-O2 -pipe -march=armv8-a
+          EOF
+
+          binary="$prefix/sbin/nginx"
+          if ldd "$binary" | grep -q 'not found'; then
+            ldd "$binary"
+            exit 1
+          fi
+
+          max_glibc="$({
+            readelf --version-info "$binary"
+            find "$prefix" -type f -name '*.so*' -exec readelf --version-info '{}' \;
+          } 2>/dev/null | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -Vu | tail -n 1)"
+          test -n "$max_glibc"
+          test "$(printf '%s\n' 2.28 "$max_glibc" | sort -V | tail -n 1)" = '2.28'
+          echo "Maximum required glibc symbol: GLIBC_${max_glibc}"
+
+          mkdir -p dist
+          tar -czf "dist/${PACKAGE_NAME}.tar.gz" -C "$RUNNER_TEMP" "$PACKAGE_NAME"
+          sha256sum "dist/${PACKAGE_NAME}.tar.gz" \
+            > "dist/${PACKAGE_NAME}.tar.gz.sha256"
+          tar -tzf "dist/${PACKAGE_NAME}.tar.gz" >/dev/null
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: nginx-${{ steps.build.outputs.version }}-linux-${{ env.PACKAGE_PLATFORM }}
+          path: |
+            dist/nginx-${{ steps.build.outputs.version }}-linux-${{ env.PACKAGE_PLATFORM }}.tar.gz
+            dist/nginx-${{ steps.build.outputs.version }}-linux-${{ env.PACKAGE_PLATFORM }}.tar.gz.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
