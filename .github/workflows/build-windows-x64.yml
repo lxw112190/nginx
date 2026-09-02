@@ -1,0 +1,182 @@
+name: Windows x64
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches:
+      - master
+      - 'stable-1.*'
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - master
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PACKAGE_PLATFORM: windows-x64
+
+jobs:
+  windows-x64:
+    name: Windows x64 / MSVC
+    runs-on: windows-2022
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up MSVC x64 environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Verify Windows toolchain
+        shell: pwsh
+        run: |
+          $required = 'cl', 'link', 'nmake', 'perl', 'bash', 'tar'
+          foreach ($tool in $required) {
+            if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
+              throw "Required tool not found: $tool"
+            }
+          }
+          cl 2>&1 | Select-Object -First 2
+          nmake /? 2>&1 | Select-Object -First 2
+          perl -v | Select-String 'This is perl'
+
+      - name: Download pinned build dependencies
+        shell: pwsh
+        run: |
+          $dependencyRoot = Join-Path $env:GITHUB_WORKSPACE 'objs.msvc8\lib'
+          New-Item -ItemType Directory -Force -Path $dependencyRoot | Out-Null
+
+          $dependencies = @(
+            @{ Name = 'openssl-3.5.8'; Url = 'https://www.openssl.org/source/openssl-3.5.8.tar.gz' },
+            @{ Name = 'pcre2-10.48'; Url = 'https://github.com/PCRE2Project/pcre2/releases/download/pcre2-10.48/pcre2-10.48.tar.gz' },
+            @{ Name = 'zlib-1.3.2'; Url = 'https://zlib.net/fossils/zlib-1.3.2.tar.gz' }
+          )
+
+          foreach ($dependency in $dependencies) {
+            $archive = Join-Path $env:RUNNER_TEMP "$($dependency.Name).tar.gz"
+            curl.exe -L --fail --retry 5 --retry-delay 5 --retry-connrefused `
+              $dependency.Url -o $archive
+            tar.exe -xzf $archive -C $dependencyRoot
+            if (-not (Test-Path (Join-Path $dependencyRoot $dependency.Name))) {
+              throw "Dependency was not extracted: $($dependency.Name)"
+            }
+          }
+
+      - name: Configure and build NGINX
+        id: build
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^#define NGINX_VERSION[[:space:]]*"\([^"]*\)"/\1/p' src/core/nginx.h)"
+          test -n "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "PACKAGE_NAME=nginx-${version}-windows-x64" >> "$GITHUB_ENV"
+
+          ./auto/configure \
+            --with-cc=cl \
+            --builddir=objs.msvc8 \
+            --prefix= \
+            --conf-path=conf/nginx.conf \
+            --pid-path=logs/nginx.pid \
+            --http-log-path=logs/access.log \
+            --error-log-path=logs/error.log \
+            --sbin-path=nginx.exe \
+            --http-client-body-temp-path=temp/client_body_temp \
+            --http-proxy-temp-path=temp/proxy_temp \
+            --http-fastcgi-temp-path=temp/fastcgi_temp \
+            --http-scgi-temp-path=temp/scgi_temp \
+            --http-uwsgi-temp-path=temp/uwsgi_temp \
+            --with-cc-opt=-DFD_SETSIZE=1024 \
+            --with-pcre=objs.msvc8/lib/pcre2-10.48 \
+            --with-zlib=objs.msvc8/lib/zlib-1.3.2 \
+            --with-http_v2_module \
+            --with-http_realip_module \
+            --with-http_addition_module \
+            --with-http_sub_module \
+            --with-http_stub_status_module \
+            --with-http_flv_module \
+            --with-http_mp4_module \
+            --with-http_gunzip_module \
+            --with-http_gzip_static_module \
+            --with-http_auth_request_module \
+            --with-http_random_index_module \
+            --with-http_secure_link_module \
+            --with-http_slice_module \
+            --with-mail \
+            --with-stream \
+            --with-stream_realip_module \
+            --with-stream_ssl_preread_module \
+            --with-openssl=objs.msvc8/lib/openssl-3.5.8 \
+            --with-openssl-opt="no-asm no-tests no-makedepend -D_WIN32_WINNT=0x0501" \
+            --with-http_ssl_module \
+            --with-mail_ssl_module \
+            --with-stream_ssl_module
+          nmake -f objs.msvc8/Makefile
+
+      - name: Stage and verify Windows artifact
+        shell: pwsh
+        run: |
+          $stage = Join-Path $env:RUNNER_TEMP $env:PACKAGE_NAME
+          Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $stage, "$stage\conf", "$stage\html", "$stage\logs", "$stage\temp" | Out-Null
+
+          Copy-Item -LiteralPath 'objs.msvc8\nginx.exe' -Destination "$stage\nginx.exe"
+          Copy-Item -Path 'conf\*' -Destination "$stage\conf" -Recurse
+          Copy-Item -Path 'docs\html\*' -Destination "$stage\html" -Recurse
+          Copy-Item -LiteralPath 'LICENSE' -Destination "$stage\LICENSE"
+          Copy-Item -LiteralPath 'README.md' -Destination "$stage\README.md"
+          New-Item -ItemType File -Force -Path "$stage\logs\.keep", "$stage\temp\.keep" | Out-Null
+
+          $headers = (dumpbin /headers "$stage\nginx.exe" | Out-String)
+          if ($headers -notmatch 'machine \(x64\)') {
+            throw 'The build is not a Windows x64 executable.'
+          }
+
+          & "$stage\nginx.exe" -V
+          & "$stage\nginx.exe" -t -p "$stage\" -c "$stage\conf\nginx.conf"
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+          $buildInfo = @"
+          package_platform=$env:PACKAGE_PLATFORM
+          nginx_version=$($env:PACKAGE_NAME -replace '^nginx-|-windows-x64$','')
+          architecture=x64
+          compiler=MSVC
+          openssl=3.5.8
+          pcre2=10.48
+          zlib=1.3.2
+          "@
+          $buildInfo.Trim() | Set-Content -LiteralPath "$stage\BUILD-ENVIRONMENT.txt" -Encoding ascii
+
+          New-Item -ItemType Directory -Force -Path 'dist' | Out-Null
+          $archive = Join-Path $env:GITHUB_WORKSPACE "dist\$env:PACKAGE_NAME.zip"
+          Compress-Archive -Path "$stage\*" -DestinationPath $archive -CompressionLevel Optimal -Force
+          $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $([System.IO.Path]::GetFileName($archive))" |
+            Set-Content -LiteralPath "$archive.sha256" -Encoding ascii
+          $check = Join-Path $env:RUNNER_TEMP 'artifact-check'
+          Remove-Item -LiteralPath $check -Recurse -Force -ErrorAction SilentlyContinue
+          Expand-Archive -LiteralPath $archive -DestinationPath $check -Force
+          if (-not (Test-Path (Join-Path $check 'nginx.exe'))) {
+            throw 'The generated ZIP does not contain nginx.exe at its root.'
+          }
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: nginx-${{ steps.build.outputs.version }}-windows-x64
+          path: |
+            dist/nginx-${{ steps.build.outputs.version }}-windows-x64.zip
+            dist/nginx-${{ steps.build.outputs.version }}-windows-x64.zip.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
