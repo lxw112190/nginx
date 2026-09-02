@@ -53,7 +53,14 @@ jobs:
             throw 'Strawberry Perl was not found on the Windows runner.'
           }
           $perlDirectory = Split-Path -Parent $perl
+          $msvcDirectory = Split-Path -Parent (Get-Command cl.exe).Source
+          $env:Path = "$msvcDirectory;$env:Path"
           Add-Content -Path $env:GITHUB_PATH -Value $perlDirectory
+          Add-Content -Path $env:GITHUB_PATH -Value $msvcDirectory
+          Add-Content -Path $env:GITHUB_ENV -Value "MSVC_DIRECTORY=$msvcDirectory"
+          if ((Get-Command link.exe).Source -ne (Join-Path $msvcDirectory 'link.exe')) {
+            throw "MSVC linker was not selected: $((Get-Command link.exe).Source)"
+          }
           cl 2>&1 | Select-Object -First 2
           nmake /? 2>&1 | Select-Object -First 2
           & $perl -v | Select-String 'This is perl'
@@ -86,6 +93,14 @@ jobs:
         run: |
           set -euo pipefail
           export PATH="/c/Strawberry/perl/bin:/c/Strawberry/bin:$PATH"
+          msvc_directory="$(cygpath -u "$MSVC_DIRECTORY")"
+          export PATH="$msvc_directory:$PATH"
+          hash -r
+          link_path="$(command -v link.exe || command -v link)"
+          case "$link_path" in
+            "$msvc_directory"/link|"$msvc_directory"/link.exe) ;;
+            *) echo "Unexpected linker: $link_path" >&2; exit 1 ;;
+          esac
           test "$(command -v perl)" != "/usr/bin/perl"
           version="$(sed -n 's/^#define NGINX_VERSION[[:space:]]*"\([^"]*\)"/\1/p' src/core/nginx.h)"
           test -n "$version"
