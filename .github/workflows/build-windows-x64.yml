@@ -168,10 +168,16 @@ jobs:
           }
 
           & "$stage\nginx.exe" -V
-          & "$stage\nginx.exe" -t -p "$stage\" -c "$stage\conf\nginx.conf"
+          $testConfig = Join-Path $stage 'conf\nginx-ci.conf'
+          $testPort = Get-Random -Minimum 20000 -Maximum 40000
+          $config = Get-Content -LiteralPath "$stage\conf\nginx.conf" -Raw
+          $config = $config -replace '(?m)^(\s*listen\s+)80(\s*;)', ('${1}' + $testPort + '${2}')
+          Set-Content -LiteralPath $testConfig -Value $config -Encoding ascii
+          & "$stage\nginx.exe" -t -p "$stage\" -c $testConfig
           if ($LASTEXITCODE -ne 0) {
             exit $LASTEXITCODE
           }
+          Remove-Item -LiteralPath $testConfig -Force
 
           $buildInfo = @"
           package_platform=$env:PACKAGE_PLATFORM
