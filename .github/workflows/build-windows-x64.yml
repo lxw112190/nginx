@@ -39,15 +39,24 @@ jobs:
       - name: Verify Windows toolchain
         shell: pwsh
         run: |
-          $required = 'cl', 'link', 'nmake', 'perl', 'bash', 'tar'
+          $required = 'cl', 'link', 'nmake', 'bash', 'tar'
           foreach ($tool in $required) {
             if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
               throw "Required tool not found: $tool"
             }
           }
+          $perl = @(
+            'C:\Strawberry\perl\bin\perl.exe',
+            'C:\Strawberry\bin\perl.exe'
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $perl) {
+            throw 'Strawberry Perl was not found on the Windows runner.'
+          }
+          $perlDirectory = Split-Path -Parent $perl
+          Add-Content -Path $env:GITHUB_PATH -Value $perlDirectory
           cl 2>&1 | Select-Object -First 2
           nmake /? 2>&1 | Select-Object -First 2
-          perl -v | Select-String 'This is perl'
+          & $perl -v | Select-String 'This is perl'
 
       - name: Download pinned build dependencies
         shell: pwsh
@@ -76,6 +85,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          export PATH="/c/Strawberry/perl/bin:/c/Strawberry/bin:$PATH"
+          test "$(command -v perl)" != "/usr/bin/perl"
           version="$(sed -n 's/^#define NGINX_VERSION[[:space:]]*"\([^"]*\)"/\1/p' src/core/nginx.h)"
           test -n "$version"
           echo "version=$version" >> "$GITHUB_OUTPUT"
@@ -84,7 +95,7 @@ jobs:
           ./auto/configure \
             --with-cc=cl \
             --builddir=objs.msvc8 \
-            --prefix= \
+            --prefix=. \
             --conf-path=conf/nginx.conf \
             --pid-path=logs/nginx.pid \
             --http-log-path=logs/access.log \
